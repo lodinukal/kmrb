@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 
 comptime {
-    _ = @import("parser.zig");
+    _ = @import("Parser.zig");
 }
 
 export fn add(a: i32, b: i32) i32 {
