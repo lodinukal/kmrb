@@ -13,6 +13,8 @@ peek_list: [10]Lexer.Token = .{Lexer.Token.invalid} ** 10,
 this_token: Lexer.Token = undefined,
 last_token: Lexer.Token = undefined,
 
+this_procedure: ?Ast.Index = null,
+
 trace_depth: i32 = 0,
 expression_depth: i32 = 0,
 
@@ -536,7 +538,7 @@ fn parseCompoundLiteralExpression(self: *Parser, typ: ?Ast.Index) !Ast.Index {
     var buf = std.mem.zeroes([512]u8);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    var fields = std.ArrayList(Ast.Index).init(fba.allocator());
+    var fields = std.ArrayList(Ast.Expression).init(fba.allocator());
     const depth = self.expression_depth;
     self.expression_depth = 0;
 
@@ -547,16 +549,14 @@ fn parseCompoundLiteralExpression(self: *Parser, typ: ?Ast.Index) !Ast.Index {
         if (isAssignment(self.this_token, .eq)) {
             _ = try self.expectAssignment(.eq);
             const value = self.parseValue() catch return error.Parse;
-            const field = try self.ast.appendExpression(.{ .field = .{
+            try fields.append(.{ .field = .{
                 .name = name,
                 .value = value,
             } });
-            try fields.append(field);
         } else {
-            const field = try self.ast.appendExpression(.{ .field = .{
+            try fields.append(.{ .field = .{
                 .name = name,
             } });
-            try fields.append(field);
         }
         if (!self.acceptedSeparator()) break;
     }
@@ -812,18 +812,22 @@ fn parseBody(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     self.allow_newline = allow_newline;
     self.expression_depth = depth;
 
-    return try self.ast.newBlockStatement(block_flags, statements, null);
+    return try self.ast.appendExpression(.{ .block = .{
+        .flags = block_flags,
+        .statements = statements,
+        .label = null,
+    } });
 }
 
-fn parseRhsTupleExpression(self: *Parser) !Ast.ExpressionIndex {
+fn parseRhsTupleExpression(self: *Parser) !Ast.Index {
     return try self.parseTupleExpression(false);
 }
 
-fn parseProcedure(self: *Parser) !Ast.ExpressionIndex {
-    const ty = try self.parseProcedureType();
+fn parseProcedure(self: *Parser) !Ast.Index {
+    const typ = try self.parseProcedureType();
     _ = try self.advancePossibleNewline();
 
-    var where_clauses: ?Ast.ExpressionIndex = null;
+    var where_clauses: ?Ast.Index = null;
     if (isKeyword(self.this_token, .where)) {
         _ = try self.expectKeyword(.where);
         const depth = self.expression_depth;
@@ -832,7 +836,7 @@ fn parseProcedure(self: *Parser) !Ast.ExpressionIndex {
         self.expression_depth = depth;
     }
 
-    var flags = self.ast.getType(ty).derived.procedure.flags;
+    var flags = self.ast.getExpression(typ).typ.procedure.flags;
 
     while (isKind(self.this_token, .directive)) {
         const token = try self.expectKind(.directive);
@@ -845,31 +849,501 @@ fn parseProcedure(self: *Parser) !Ast.ExpressionIndex {
             .type_assert => flags.type_assert = true,
             else => {
                 self.err("Unknown procedure flag `{s}`", .{@tagName(token.un.directive)});
-                return error.ParseProcedure;
+                return error.Parse;
             },
         }
     }
 
-    self.ast.getType(ty).derived.procedure.flags = flags;
+    self.ast.mutateExpression(typ).typ.procedure.flags = flags;
 
     if (self.acceptedKind(.undefined)) {
         if (where_clauses) |_| {
             self.err("Procedures with `where` clauses need bodies", .{});
-            return error.ParseProcedure;
+            return error.Parse;
         }
-        return try self.ast.newProcedureExpression(ty, null, null);
+        return try self.ast.appendExpression(.{ .procedure = .{
+            .typ = typ,
+            .where_clauses = where_clauses,
+            .body = null,
+        } });
     } else if (isKind(self.this_token, .lbrace)) {
         const block_flags = Ast.BlockFlags{
             .bounds_check = flags.bounds_check,
             .type_assert = flags.type_assert,
         };
-        self.this_procedure = ty;
+        self.this_procedure = typ;
         const body = try self.parseBody(block_flags);
-        return try self.ast.newProcedureExpression(ty, where_clauses, body);
+        return try self.ast.appendExpression(.{ .procedure = .{
+            .typ = typ,
+            .where_clauses = where_clauses,
+            .body = body,
+        } });
     }
 
     // no body or equivalent, must be a type
-    return try self.ast.newTypeExpression(ty);
+    return try self.ast.appendExpression(.{
+        .typ = .{ .expression = .{
+            .expression = typ,
+        } },
+    });
+}
+
+fn parseCallExpression(self: *Parser, operand: Ast.Index) !Ast.Index {
+    var buf = std.mem.zeroes([512]u8);
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var arguments = std.ArrayList(Ast.Expression).init(fba.allocator());
+    const depth = self.expression_depth;
+    const allow_newline = self.allow_newline;
+    self.expression_depth = 0;
+    self.allow_newline = true;
+
+    _ = try self.expectOperator(.lparen);
+
+    var seen_ellipsis = false;
+    while (!isOperator(self.this_token, .rparen) and !isKind(self.this_token, .eof)) {
+        if (isOperator(self.this_token, .comma)) {
+            self.err("Expected expression, got `,`", .{});
+            return error.Parse;
+        } else if (isAssignment(self.this_token, .eq)) {
+            self.err("Expected expression, got `=`", .{});
+            return error.Parse;
+        }
+
+        var has_ellipsis = false;
+        if (isOperator(self.this_token, .ellipsis)) {
+            has_ellipsis = true;
+            _ = try self.expectOperator(.ellipsis);
+        }
+
+        const argument = try self.parseExpression(false);
+        if (isAssignment(self.this_token, .eq)) {
+            _ = try self.expectAssignment(.eq);
+            if (has_ellipsis) {
+                self.err("Cannot apply `..`", .{});
+                return error.Parse;
+            }
+            if (self.evaluateIdentifierExpression(argument)) |name| {
+                try arguments.append(.{ .field = .{
+                    .name = name,
+                    .value = try self.parseValue(),
+                } });
+            } else {
+                self.err("Expected identifier, got `{s}`", .{@tagName(self.ast.getExpression(argument).*)});
+            }
+        } else {
+            if (seen_ellipsis) {
+                self.err("Positional arguments not allowed after `..`", .{});
+                return error.Parse;
+            }
+            try arguments.append(.{ .field = .{
+                .value = argument,
+            } });
+        }
+
+        if (has_ellipsis) {
+            seen_ellipsis = true;
+        }
+
+        if (!self.acceptedSeparator()) break;
+    }
+
+    _ = try self.expectOperator(.rparen);
+
+    self.allow_newline = allow_newline;
+    self.expression_depth = depth;
+
+    return try self.ast.appendExpression(.{ .call = .{
+        .operand = operand,
+        .arguments = try self.ast.appendManyExpression(arguments.items),
+    } });
+}
+
+fn parseStatement(self: *Parser, block_flags: Ast.BlockFlags) Error!?Ast.Index {
+    const token = self.this_token;
+    return switch (token.un) {
+        .eof => {
+            self.err("Unexpected end of file", .{});
+            return error.Parse;
+        },
+        .literal => |lit| switch (lit) {
+            inline else => return try self.parseBasicSimpleStatement(block_flags),
+        },
+        .keyword => |kw| switch (kw) {
+            .context, .proc => return try self.parseBasicSimpleStatement(block_flags),
+            .foreign => return try self.parseForignDeclarationStatement(),
+            .@"if" => return try self.parseIfStatement(block_flags),
+            .when => return try self.parseWhenStatement(),
+            .import => return try self.parseImportStatement(false),
+            .@"for" => return try self.parseForStatement(block_flags),
+            .@"switch" => return try self.parseSwitchStatement(block_flags),
+            .@"defer" => return try self.parseDeferStatement(block_flags),
+            .@"return" => return try self.parseReturnStatement(),
+            .@"break",
+            .@"continue",
+            .fallthrough,
+            => |in_kw| return try self.parseBranchStatement(in_kw),
+            .using => return try self.parseUsingStatement(),
+            .package => return try self.parsePackageStatement(),
+            else => {
+                self.err("Unexpected keyword `{s}`", .{@tagName(kw)});
+                return error.Parse;
+            },
+        },
+        .identifier => return try self.parseBasicSimpleStatement(block_flags),
+        .operator => |op| switch (op) {
+            .lparen,
+            .pointer,
+            .add,
+            .sub,
+            .xor,
+            .not,
+            .@"and",
+            => return try self.parseBasicSimpleStatement(block_flags),
+            else => {
+                self.err("Unexpected operator `{s}`", .{@tagName(op)});
+                return error.Parse;
+            },
+        },
+        .attribute => return try self.parseAttributesForStatement(block_flags),
+        .directive => return try self.parseDirectiveForStatement(block_flags),
+        .lbrace => return try self.parseBlockStatement(block_flags, false),
+        .semicolon => return try self.parseEmptyStatement(),
+        else => {
+            self.err("Unexpected token `{s}` in statement", .{@tagName(token.un)});
+            return error.Parse;
+        },
+    };
+}
+
+fn parseUnaryExpression(self: *Parser, lhs: bool) !Ast.Index {
+    switch (self.this_token.un) {
+        .operator => |op| switch (op) {
+            .transmute, .auto_cast, .cast => return try self.parseCastExpression(lhs),
+            .add, .sub, .xor, .@"and", .not => return try self.parseUnaryStemExpression(lhs),
+            .period => return try self.parseImplicitSelectorExpression(),
+            else => {},
+        },
+        else => {},
+    }
+
+    const operand = try self.parseOperand(lhs);
+    return (try self.parseAtomExpression(operand, lhs)).?;
+}
+
+fn parseDirectiveCallExpression(self: *Parser, name: []const u8) !Ast.Index {
+    try self.record();
+    const intrinsics = try self.ast.appendExpression(.{ .identifier = .{
+        .contents = "intrinsics",
+        .polymorphic = false,
+    } });
+    const directive = try self.ast.appendExpression(.{ .identifier = .{
+        .contents = name,
+        .polymorphic = false,
+    } });
+    const selector = try self.ast.appendExpression(.{ .selector = .{
+        .operand = intrinsics,
+        .field = directive,
+    } });
+    return try self.parseCallExpression(selector);
+}
+
+fn parseDirectiveForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
+    const token = try self.expectKind(.directive);
+    const stmt: ?Ast.Index = switch (token.un.directive) {
+        .bounds_check => try self.parseStatement(blk: {
+            var flags = block_flags;
+            flags.bounds_check = true;
+            break :blk flags;
+        }),
+        .no_bounds_check => try self.parseStatement(blk: {
+            var flags = block_flags;
+            flags.bounds_check = false;
+            break :blk flags;
+        }),
+        .type_assert => try self.parseStatement(blk: {
+            var flags = block_flags;
+            flags.type_assert = true;
+            break :blk flags;
+        }),
+        .no_type_assert => try self.parseStatement(blk: {
+            var flags = block_flags;
+            flags.type_assert = false;
+            break :blk flags;
+        }),
+        .partial => try self.parseStatement(blk: {
+            // TODO: partial
+            // var flags = block_flags;
+            // flags.partial = true;
+            break :blk block_flags;
+        }),
+        .assert => try self.parseDirectiveCallExpression("assert"),
+        .panic => try self.parseDirectiveCallExpression("panic"),
+        .load => try self.parseDirectiveCallExpression("load"),
+        .unroll => try self.parseStatement(blk: {
+            // TODO: unroll
+            // var flags = block_flags;
+            // flags.partial = true;
+            break :blk block_flags;
+        }),
+        .force_inline, .force_no_inline => try self.parseStatement(blk: {
+            // TODO: force_inline, no_inline
+            // var flags = block_flags;
+            // flags.partial = true;
+            break :blk block_flags;
+        }),
+        else => {
+            self.err("Unknown statement directive `{s}`", .{@tagName(token.un.directive)});
+            return error.Parse;
+        },
+    };
+
+    return stmt orelse {
+        self.err("Expected statement after directive `{s}`", .{@tagName(token.un.directive)});
+        return error.Parse;
+    };
+}
+
+fn parseValue(self: *Parser) Error!Ast.Index {
+    if (isKind(self.this_token, .lbrace)) {
+        return self.parseCompoundLiteralExpression(null) catch return error.Parse;
+    }
+    return self.parseExpression(false) catch return error.Parse;
+}
+
+fn parseAttributesStatementTail(
+    self: *Parser,
+    block_flags: Ast.BlockFlags,
+    attributes: Ast.ManyIndex,
+) !Ast.Index {
+    _ = try self.advancePossibleNewline();
+    const stmt = (try self.parseStatement(block_flags)) orelse {
+        self.err("Attributes must be followed by statements", .{});
+        return error.Parse;
+    };
+    switch (self.ast.mutateExpression(stmt).*) {
+        inline .declaration,
+        .foreign_block,
+        .foreign_import,
+        => |*b| b.attributes = attributes,
+        else => {
+            self.err("Attributes can only be applied to declarations", .{});
+            return error.Parse;
+        },
+    }
+
+    return stmt;
+}
+
+fn parseAttributesForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
+    return try self.parseAttributesStatementTail(block_flags, try self.parseAttributes());
+}
+
+fn parseAttributes(self: *Parser) !Ast.ManyIndex {
+    _ = try self.expectKind(.attribute);
+    var buf = std.mem.zeroes([512]u8);
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var attributes = std.ArrayList(Ast.Expression).init(fba.allocator());
+    if (isKind(self.this_token, .identifier)) {
+        const ident = try self.parseIdentifier(false);
+        const value: ?Ast.Index = blk: {
+            if (isOperator(self.this_token, .lparen)) {
+                _ = try self.expectOperator(.lparen);
+                const found = try self.parseValue();
+                _ = try self.expectOperator(.rparen);
+                break :blk found;
+            }
+            break :blk null;
+        };
+        try attributes.append(.{
+            .field = .{
+                .name = ident,
+                .value = value,
+            },
+        });
+    } else {
+        _ = try self.expectOperator(.lparen);
+        self.expression_depth += 1;
+        while (!isOperator(self.this_token, .rparen) and !isKind(self.this_token, .eof)) {
+            const ident = try self.parseIdentifier(false);
+            const value: ?Ast.Index = blk: {
+                if (isAssignment(self.this_token, .eq)) {
+                    _ = try self.expectAssignment(.eq);
+                    break :blk try self.parseValue();
+                }
+                break :blk null;
+            };
+            try attributes.append(.{ .field = .{
+                .name = ident,
+                .value = value,
+            } });
+            if (!self.acceptedSeparator()) break;
+        }
+        self.expression_depth -= 1;
+        _ = try self.expectOperator(.rparen);
+    }
+    return try self.ast.appendManyExpression(attributes.items);
+}
+
+fn parseSomeAttributes(self: *Parser) !Ast.ManyIndex {
+    if (!isKind(self.this_token, .attribute)) return .none;
+    return try self.parseAttributes();
+}
+
+fn parseIdentifierExpression(self: *Parser) !Ast.Index {
+    return try self.parseIdentifier(false);
+}
+
+fn parseLiteralExpression(self: *Parser) !Ast.Index {
+    const token = try self.advance();
+    if (token.un != .literal) {
+        self.err("Expected literal, got `{s}`", .{@tagName(token.un)});
+        return error.Parse;
+    }
+    return try self.ast.appendExpression(.{ .literal = .{
+        .kind = token.un.literal,
+        .value = token.string,
+    } });
+}
+
+fn parseBitSetTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKeyword(.bit_set);
+    _ = try self.expectOperator(.lbracket);
+    const expression = try self.parseExpression(false);
+    const underlying_ty: ?Ast.Index = blk: {
+        if (self.acceptedKind(.semicolon)) {
+            break :blk try self.parseType();
+        }
+        break :blk null;
+    };
+    _ = try self.expectOperator(.rbracket);
+    return try self.ast.appendExpression(.{ .typ = .{ .bitset = .{
+        .expression = expression,
+        .typ = underlying_ty,
+    } } });
+}
+
+fn parseTypeidTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKeyword(.typeid);
+    return try self.ast.appendExpression(.{ .typ = .{ .typeid = .{
+        .specialisation = null,
+    } } });
+}
+
+fn parseMapTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKeyword(.map);
+    _ = try self.expectOperator(.lbracket);
+    const key_expression = try self.parseExpression(true);
+    _ = try self.expectOperator(.rbracket);
+    const value = try self.parseType();
+    const key = try self.ast.appendExpression(.{ .typ = .{
+        .expression = key_expression,
+    } });
+    return try self.ast.appendExpression(.{ .typ = .{ .map = .{
+        .key = key,
+        .value = value,
+    } } });
+}
+
+fn parseMatrixTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKeyword(.matrix);
+    _ = try self.expectOperator(.lbracket);
+    const rows_expression = try self.parseExpression(true);
+    _ = try self.expectOperator(.comma);
+    const columns_expression = try self.parseExpression(true);
+    _ = try self.expectOperator(.rbracket);
+
+    const base_ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .matrix = .{
+        .rows = rows_expression,
+        .columns = columns_expression,
+        .typ = base_ty,
+    } } });
+}
+
+fn parsePointerTypeExpression(self: *Parser) !Ast.Index {
+    const is_const = self.acceptedKeyword(.@"const");
+    _ = try self.expectOperator(.pointer);
+    const typ = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .pointer = .{
+        .is_const = is_const,
+        .typ = typ,
+    } } });
+}
+
+fn parseMultiPointerTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectOperator(.pointer);
+    const is_const = self.acceptedKeyword(.@"const");
+    _ = try self.expectOperator(.rbracket);
+
+    const ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .multipointer = .{
+        .is_const = is_const,
+        .typ = ty,
+    } } });
+}
+
+fn parseArrayTypeExpression(self: *Parser, parse_count: bool) !Ast.Index {
+    const count: ?Ast.Index = blk: {
+        if (parse_count) {
+            self.expression_depth += 1;
+            const c = try self.parseExpression(false);
+            self.expression_depth -= 1;
+            break :blk c;
+        }
+        _ = try self.expectOperator(.question);
+        break :blk null;
+    };
+    _ = try self.expectOperator(.rbracket);
+
+    const ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .array = .{
+        .count = count,
+        .typ = ty,
+    } } });
+}
+
+fn parseDynamicArrayTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectOperator(.rbracket);
+    const ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .dynamic_array = .{
+        .typ = ty,
+    } } });
+}
+
+fn parseSliceTypeExpression(self: *Parser) !Ast.Index {
+    const is_const = self.acceptedKeyword(.@"const");
+    const ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .slice = .{
+        .is_const = is_const,
+        .typ = ty,
+    } } });
+}
+
+fn parseDistinctTypeExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKeyword(.distinct);
+    const ty = try self.parseType();
+    return try self.ast.appendExpression(.{ .typ = .{ .distinct = .{
+        .typ = ty,
+    } } });
+}
+
+fn parseProcedureGroupExpression(self: *Parser) !Ast.Index {
+    var buf = std.mem.zeroes([512]u8);
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var expressions = std.ArrayList(Ast.Expression).init(fba.allocator());
+    _ = try self.expectKind(.lbrace);
+    while (!isKind(self.this_token, .rbrace) and !isKind(self.this_token, .eof)) {
+        try expressions.append(Ast.AnyIndex.from(try self.parseExpression(false)));
+        if (!self.acceptedSeparator()) break;
+    }
+    _ = try self.expectKind(.rbrace);
+
+    return try self.ast.newProcedureGroupExpression(
+        try self.ast.createRef(expressions.items),
+    );
 }
 
 // utils

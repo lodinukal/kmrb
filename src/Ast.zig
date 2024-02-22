@@ -67,9 +67,13 @@ pub const Expression = union(Tag) {
         unwrap,
         unary,
         compound_literal,
+        block,
+        call,
+        literal,
         context,
 
         many,
+        ref,
         field,
         case_clause,
     };
@@ -80,9 +84,14 @@ pub const Expression = union(Tag) {
     unwrap: Unwrap,
     unary: Unary,
     compound_literal: CompoundLiteral,
+    block: Block,
+    procedure: Procedure,
+    call: Call,
+    literal: Literal,
     context: void,
 
     many: usize, // comes right after the current expression
+    ref: Index, // points to another Index
     field: Field,
     case_clause: CaseClause,
 
@@ -229,6 +238,29 @@ pub const Expression = union(Tag) {
     pub const CompoundLiteral = struct {
         typ: ?Index,
         fields: ManyIndex,
+    };
+
+    pub const Block = struct {
+        flags: BlockFlags,
+        statements: ManyIndex,
+        // identifier
+        label: ?Index,
+    };
+
+    pub const Procedure = struct {
+        typ: Index,
+        where_clauses: ?Index,
+        body: ?Index,
+    };
+
+    pub const Call = struct {
+        operand: Index,
+        arguments: ManyIndex,
+    };
+
+    pub const Literal = struct {
+        kind: lexemes.LiteralKind,
+        value: []const u8,
     };
 
     pub const Field = struct {
