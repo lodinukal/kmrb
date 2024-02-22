@@ -44,14 +44,14 @@ pub fn appendManyExpression(self: *Ast, items: []const Expression) !ManyIndex {
 }
 
 pub fn getManyExpression(self: *Ast, index: ManyIndex) []const Expression {
-    if (index == .none) @panic("Invalid index");
+    if (index == .none) return &.{};
     const start = @intFromEnum(index);
     const end = start + self.expressions.items[start].many;
     return self.expressions.items[start + 1 .. end];
 }
 
 pub fn mutateManyExpression(self: *Ast, index: ManyIndex) []Expression {
-    if (index == .none) @panic("Invalid index");
+    if (index == .none) return &.{};
     const start = @intFromEnum(index);
     const end = start + self.expressions.items[start].many;
     return self.expressions.items[start + 1 .. end];
@@ -70,6 +70,13 @@ pub const Expression = union(Tag) {
         block,
         call,
         literal,
+        procedure_group,
+        undefined,
+        index,
+        cast,
+        ternary,
+        binary,
+        statement,
         context,
 
         many,
@@ -88,6 +95,13 @@ pub const Expression = union(Tag) {
     procedure: Procedure,
     call: Call,
     literal: Literal,
+    procedure_group: ManyIndex,
+    undefined: void,
+    index: IndexSelector,
+    cast: Cast,
+    ternary: Ternary,
+    binary: Binary,
+    statement: Statement,
     context: void,
 
     many: usize, // comes right after the current expression
@@ -100,7 +114,7 @@ pub const Expression = union(Tag) {
         polymorphic: bool,
     };
 
-    pub const Typ = union {
+    pub const Typ = union(enum) {
         builtin: BuiltinType,
         identifier: Index,
         procedure: ProcedureType,
@@ -249,7 +263,7 @@ pub const Expression = union(Tag) {
 
     pub const Procedure = struct {
         typ: Index,
-        where_clauses: ?Index,
+        where_clauses: ?ManyIndex,
         body: ?Index,
     };
 
@@ -261,6 +275,53 @@ pub const Expression = union(Tag) {
     pub const Literal = struct {
         kind: lexemes.LiteralKind,
         value: []const u8,
+    };
+
+    pub const IndexSelector = struct {
+        operand: Index,
+        lhs: ?Index,
+        rhs: ?Index,
+    };
+
+    pub const Cast = struct {
+        operation: lexemes.KeywordKind,
+        typ: Index,
+        expression: Index,
+    };
+
+    pub const Ternary = struct {
+        operation: lexemes.KeywordKind,
+        on_true: Index,
+        condition: Index,
+        on_false: Index,
+
+        pub inline fn isRuntime(self: Ternary) bool {
+            return self.operation == .@"if";
+        }
+    };
+
+    pub const Binary = struct {
+        operation: lexemes.OperatorKind,
+        lhs: Index,
+        rhs: Index,
+    };
+
+    pub const Statement = union(enum) {
+        empty,
+        declaration: Declaration,
+
+        pub const Declaration = struct {
+            pub const Kind = enum {
+                variable,
+                constant,
+            };
+
+            identifiers: ManyIndex,
+            typ: ?Index,
+            values: ManyIndex,
+            kind: Kind,
+            attributes: ?ManyIndex,
+        };
     };
 
     pub const Field = struct {
@@ -284,18 +345,6 @@ pub fn expressionInit(comptime tag: Expression.Tag) fn (e: anytype) Expression {
         }
     }.init;
 }
-
-pub const Declaration = struct {
-    pub const Type = enum {
-        variable,
-        constant,
-    };
-
-    identifier: []const u8,
-    type_identifier: ?Index,
-    type: Type,
-    value: Index,
-};
 
 pub const BuiltinTypeKind = enum(u8) {
     sint = 0, // i8,i{16,32,64,128}(le|be)
