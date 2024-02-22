@@ -50,11 +50,53 @@ pub fn getManyExpression(self: *Ast, index: ManyIndex) []const Expression {
     return self.expressions.items[start + 1 .. end];
 }
 
+pub fn iterateManyExpression(self: *Ast, index: ManyIndex) ManyIterator(false) {
+    return ManyIterator(false){
+        .ast = self,
+        .index = index,
+        .current = @intFromEnum(index) + 1,
+        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many,
+    };
+}
+
 pub fn mutateManyExpression(self: *Ast, index: ManyIndex) []Expression {
     if (index == .none) return &.{};
     const start = @intFromEnum(index);
     const end = start + self.expressions.items[start].many;
     return self.expressions.items[start + 1 .. end];
+}
+
+pub fn iterateManyExpressionMut(self: *Ast, index: ManyIndex) ManyIterator(true) {
+    return ManyIterator(true){
+        .ast = self,
+        .index = index,
+        .current = @intFromEnum(index) + 1,
+        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many,
+    };
+}
+
+pub fn ManyIterator(comptime mutable: bool) type {
+    return struct {
+        ast: *Ast,
+        index: ManyIndex,
+        current: usize,
+        end: usize,
+
+        pub fn next(self: *ManyIterator) ?Expression {
+            if (self.current == self.end) return null;
+            const result = self.ast.expressions.items[self.current];
+            self.current += 1;
+            return result;
+        }
+
+        pub fn nextMut(self: *ManyIterator) ?*Expression {
+            if (comptime !mutable) @compileError("Iterator is not mutable");
+            if (self.current == self.end) return null;
+            const result = &self.ast.expressions.items[self.current];
+            self.current += 1;
+            return result;
+        }
+    };
 }
 
 pub const Index = enum(usize) { none = std.math.maxInt(usize), _ };

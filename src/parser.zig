@@ -1920,14 +1920,15 @@ fn parseDeclarationStatement(self: *Parser, lhs: Ast.ManyIndex, is_using: bool) 
     var buf = std.mem.zeroes([512]u8);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var names = std.ArrayList(Ast.Expression).init(fba.allocator());
-    for (self.ast.getManyExpression(lhs)) |expr| {
+    var it = self.ast.iterateManyExpression(lhs);
+    while (it.next()) |expr| {
         if (self.evaluateIdentifierExpression(expr.to(Ast.ExpressionIndex))) |ident| {
             try names.append(Ast.AnyIndex.from(ident));
         } else {
             self.err("Expected identifier, got `{s}`", .{
                 @tagName(self.ast.getExpressionConst(expr.to(Ast.ExpressionIndex)).*),
             });
-            return error.ParseDeclarationStatement;
+            return error.Parse;
         }
     }
 
