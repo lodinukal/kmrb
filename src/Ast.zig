@@ -1,20 +1,35 @@
 const std = @import("std");
 
 const Ast = @This();
+const Lexer = @import("Lexer.zig");
 const lexemes = @import("lexemes.zig");
 
 allocator: std.mem.Allocator,
-expressions: std.ArrayList(Expression),
+expressions: std.ArrayListUnmanaged(Expression),
+imports: std.ArrayListUnmanaged(Index),
+tokens: std.ArrayListUnmanaged(Lexer.Token),
 
 pub fn init(allocator: std.mem.Allocator) Ast {
     return Ast{
         .allocator = allocator,
-        .expressions = std.ArrayList(Expression).init(std.testing.allocator),
+        .expressions = std.ArrayList(Expression).init(allocator),
+        .imports = std.ArrayList(Index).init(allocator),
+        .tokens = std.ArrayList(Lexer.Token).init(allocator),
     };
 }
 
 pub fn deinit(self: *Ast) void {
-    self.expressions.deinit();
+    self.expressions.deinit(self.allocator);
+    self.imports.deinit(self.allocator);
+    self.tokens.deinit(self.allocator);
+}
+
+pub fn recordToken(self: *Ast, token: Lexer.Token) !void {
+    try self.tokens.append(self.allocator, token);
+}
+
+pub fn addImport(self: *Ast, index: Index) !void {
+    try self.imports.append(self.allocator, index);
 }
 
 pub fn getExpression(self: *Ast, index: Index) Expression {
@@ -77,24 +92,42 @@ pub fn iterateManyExpressionMut(self: *Ast, index: ManyIndex) ManyIterator(true)
 
 pub fn ManyIterator(comptime mutable: bool) type {
     return struct {
+        const Self = @This();
         ast: *Ast,
         index: ManyIndex,
         current: usize,
         end: usize,
 
-        pub fn next(self: *ManyIterator) ?Expression {
+        const Give = if (mutable) *Expression else Expression;
+
+        pub const Result = struct {
+            expression: Give,
+            index: Index,
+        };
+
+        pub fn next(self: *Self) ?Result {
             if (self.current == self.end) return null;
             const result = self.ast.expressions.items[self.current];
-            self.current += 1;
-            return result;
+            defer self.current += 1;
+            return Result{
+                .expression = result,
+                .index = @enumFromInt(self.current),
+            };
         }
 
-        pub fn nextMut(self: *ManyIterator) ?*Expression {
+        pub fn nextMut(self: *Self) ?Result {
             if (comptime !mutable) @compileError("Iterator is not mutable");
             if (self.current == self.end) return null;
             const result = &self.ast.expressions.items[self.current];
-            self.current += 1;
-            return result;
+            defer self.current += 1;
+            return Result{
+                .expression = result,
+                .index = @enumFromInt(self.current),
+            };
+        }
+
+        pub fn size(self: *Self) usize {
+            return self.end - self.current;
         }
     };
 }
@@ -351,6 +384,13 @@ pub const Expression = union(Tag) {
     pub const Statement = union(enum) {
         empty,
         declaration: Declaration,
+        assignment: Assignment,
+        expression: Index,
+        import: Import,
+        ifs: If,
+        when: When,
+        fors: For,
+        switchs: Switch,
 
         pub const Declaration = struct {
             pub const Kind = enum {
@@ -364,6 +404,66 @@ pub const Expression = union(Tag) {
             kind: Kind,
             attributes: ?ManyIndex,
         };
+
+        pub const Assignment = struct {
+            assignment: lexemes.AssignmentKind,
+            lhs: Index,
+            rhs: Index,
+        };
+
+        pub const Import = struct {
+            name: []const u8,
+            collection: ?[]const u8,
+            pathname: []const u8,
+            using: bool,
+            location: Lexer.Location,
+        };
+
+        pub const If = struct {
+            /// stmt
+            init: ?Index = null,
+            /// expression
+            condition: Index,
+            /// stmt
+            body: Index,
+            /// stmt
+            elif: ?Index = null,
+            /// identifier
+            label: ?Index,
+        };
+
+        pub const When = struct {
+            /// expression
+            condition: Index,
+            /// stmt
+            body: Index,
+            /// stmt
+            elif: ?Index = null,
+        };
+
+        pub const For = struct {
+            /// stmt
+            init: ?Index,
+            /// expression
+            condition: ?Index,
+            /// stmt
+            body: Index,
+            /// stmt
+            post: ?Index = null,
+            /// identifier
+            label: ?Index,
+        };
+
+        pub const Switch = struct {
+            /// stmt
+            init: ?Index,
+            /// expression
+            condition: ?Index,
+            /// many caseclause
+            clauses: Index, // std.ArrayList(CaseClauseIndex),
+            /// identifier
+            label: ?Index,
+        };
     };
 
     pub const Field = struct {
@@ -376,7 +476,7 @@ pub const Expression = union(Tag) {
     };
 
     pub const CaseClause = struct {
-        expression: ?Index,
+        expression: ?ManyIndex,
         statements: ManyIndex,
     };
 };
