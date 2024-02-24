@@ -24,13 +24,14 @@ allow_in: bool = false,
 
 pub const Error = error{
     Parse,
+    OutOfMemory,
 };
 
-pub fn init(allocator: std.mem.Allocator, source: Lexer.Source) Parser {
+pub fn init(allocator: std.mem.Allocator) Parser {
     return Parser{
         .allocator = allocator,
         .ast = Ast.init(allocator),
-        .lexer = Lexer.init(source),
+        .lexer = undefined,
     };
 }
 
@@ -38,9 +39,28 @@ pub fn deinit(self: *Parser) void {
     self.ast.deinit();
 }
 
+pub fn takeAst(self: *Parser) Ast {
+    defer self.ast = Ast.init(self.ast.allocator);
+    return self.ast;
+}
+
+/// Ast must be cleaned up by the caller
+pub fn parse(self: *Parser, source: Lexer.Source) Error!Ast {
+    self.lexer = Lexer.init(&self.peek_list, source);
+    _ = try self.advance();
+    while (!isKind(self.this_token, .eof)) {
+        if (try self.parseStatement(Ast.BlockFlags{})) |statement| {
+            const expression = self.ast.getExpression(statement);
+            if (expression.statement != .empty)
+                try self.ast.statements.append(self.ast.allocator, statement);
+        }
+    }
+    return self.takeAst();
+}
+
 fn err(self: *const Parser, comptime msg: []const u8, args: anytype) void {
     std.log.err("{}:{}:" ++ msg, .{
-        self.this_token.location.line,
+        self.this_token.location.line + 1,
         self.this_token.location.column,
     } ++ args);
 }
@@ -78,9 +98,9 @@ fn acceptedKeyword(self: *Parser, kind: lexemes.KeywordKind) bool {
 }
 
 fn peek(self: *Parser) !Lexer.Token {
-    var token = try self.lexer.peek();
+    var token = self.lexer.peek();
     while (isKind(token, .comment)) {
-        token = try self.lexer.peek();
+        token = self.lexer.peek();
     }
     return token;
 }
@@ -239,7 +259,7 @@ fn parseIdentifier(self: *Parser, poly: bool) !Ast.Index {
 
     return try self.ast.appendExpression(.{ .identifier = .{
         .contents = token.string,
-        .poly = poly,
+        .polymorphic = poly,
     } });
 }
 
@@ -295,7 +315,7 @@ fn builtinType(self: *Parser, identifier: Ast.Expression.Identifier) !?Ast.Index
         const kind: Ast.BuiltinTypeKind = bt.@"0";
         const name: []const u8 = bt.@"1";
         const size: u32 = bt.@"2";
-        const endianness: Ast.Endianess = bt.@"3";
+        const endianness: Ast.Endianness = bt.@"3";
 
         if (std.mem.eql(u8, name, identifier.contents)) {
             return try self.ast.appendExpression(.{ .typ = .{ .builtin = .{
@@ -411,7 +431,7 @@ fn parseExpression(self: *Parser, lhs: bool) !Ast.Index {
     return self.parseBinaryExpression(lhs, 1) catch return error.Parse;
 }
 
-fn parseAtomExpression(self: *Parser, opt_operand: ?Ast.Index, lhs: bool) !?Ast.Index {
+fn parseAtomExpression(self: *Parser, opt_operand: ?Ast.Index, lhs: bool) Error!?Ast.Index {
     if (opt_operand == null) {
         if (self.allow_type) {
             return null;
@@ -481,7 +501,9 @@ fn parseAtomExpression(self: *Parser, opt_operand: ?Ast.Index, lhs: bool) !?Ast.
             .lbrace => {
                 if (!still_lhs and self.expression_depth >= 0) {
                     const ty = try self.ast.appendExpression(.{ .typ = .{
-                        .expression = operand,
+                        .expression = .{
+                            .expression = operand,
+                        },
                     } });
                     operand = try self.parseCompoundLiteralExpression(ty);
                 } else {
@@ -512,7 +534,7 @@ fn parseTypeOrIdentifier(self: *Parser) !?Ast.Index {
         if (ex) |inner_ex| {
             const got_inner_ex = self.ast.getExpression(inner_ex);
             return switch (got_inner_ex) {
-                .typ => got_inner_ex,
+                .typ => inner_ex,
                 else => try self.ast.appendExpression(.{ .typ = .{ .expression = .{
                     .expression = inner_ex,
                 } } }),
@@ -535,7 +557,7 @@ fn parseType(self: *Parser) Error!Ast.Index {
 }
 
 fn parseCompoundLiteralExpression(self: *Parser, typ: ?Ast.Index) !Ast.Index {
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var fields = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -600,6 +622,7 @@ fn evaluateIdentifierExpression(self: *Parser, expression: Ast.Index) ?Ast.Index
             if (s.operand == null) break :blk s.field;
             break :blk null;
         },
+        .ref => |r| self.evaluateIdentifierExpression(r),
         else => null,
     };
 }
@@ -812,11 +835,11 @@ fn parseBody(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     self.allow_newline = allow_newline;
     self.expression_depth = depth;
 
-    return try self.ast.appendExpression(.{ .block = .{
+    return try self.ast.appendExpression(.{ .statement = .{ .block = .{
         .flags = block_flags,
         .statements = statements,
         .label = null,
-    } });
+    } } });
 }
 
 fn parseRhsTupleExpression(self: *Parser) !Ast.ManyIndex {
@@ -889,7 +912,7 @@ fn parseProcedure(self: *Parser) !Ast.Index {
 }
 
 fn parseCallExpression(self: *Parser, operand: Ast.Index) !Ast.Index {
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var arguments = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -929,7 +952,7 @@ fn parseCallExpression(self: *Parser, operand: Ast.Index) !Ast.Index {
                     .value = try self.parseValue(),
                 } });
             } else {
-                self.err("Expected identifier, got `{s}`", .{@tagName(self.ast.getExpression(argument).*)});
+                self.err("Expected identifier, got `{s}`", .{@tagName(self.ast.getExpression(argument))});
             }
         } else {
             if (seen_ellipsis) {
@@ -1016,7 +1039,7 @@ fn parseStatement(self: *Parser, block_flags: Ast.BlockFlags) Error!?Ast.Index {
     };
 }
 
-fn parseUnaryExpression(self: *Parser, lhs: bool) !Ast.Index {
+fn parseUnaryExpression(self: *Parser, lhs: bool) Error!Ast.Index {
     switch (self.this_token.un) {
         .operator => |op| switch (op) {
             .transmute, .auto_cast, .cast => return try self.parseCastExpression(lhs),
@@ -1048,6 +1071,12 @@ fn parseDirectiveCallExpression(self: *Parser, name: []const u8) !Ast.Index {
     return try self.parseCallExpression(selector);
 }
 
+fn parseDirectiveCallStatement(self: *Parser, name: []const u8) !Ast.Index {
+    return try self.ast.appendExpression(.{
+        .statement = .{ .expression = try self.parseDirectiveCallExpression(name) },
+    });
+}
+
 fn parseDirectiveForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     const token = try self.expectKind(.directive);
     const stmt: ?Ast.Index = switch (token.un.directive) {
@@ -1077,9 +1106,9 @@ fn parseDirectiveForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.I
             // flags.partial = true;
             break :blk block_flags;
         }),
-        .assert => try self.parseDirectiveCallExpression("assert"),
-        .panic => try self.parseDirectiveCallExpression("panic"),
-        .load => try self.parseDirectiveCallExpression("load"),
+        .assert => try self.parseDirectiveCallStatement("assert"),
+        .panic => try self.parseDirectiveCallStatement("panic"),
+        .load => try self.parseDirectiveCallStatement("load"),
         .unroll => try self.parseStatement(blk: {
             // TODO: unroll
             // var flags = block_flags;
@@ -1121,7 +1150,7 @@ fn parseAttributesStatementTail(
         self.err("Attributes must be followed by statements", .{});
         return error.Parse;
     };
-    switch (self.ast.mutateExpression(stmt).*) {
+    switch (self.ast.mutateExpression(stmt).statement) {
         inline .declaration,
         .foreign_block,
         .foreign_import,
@@ -1139,14 +1168,26 @@ fn parseAttributesForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.
     return try self.parseAttributesStatementTail(block_flags, try self.parseAttributes());
 }
 
+fn parseSingleAttributeChain(self: *Parser) !Ast.Index {
+    var ident = try self.parseIdentifier(false);
+    while (isOperator(self.this_token, .period)) {
+        _ = try self.expectOperator(.period);
+        ident = try self.ast.appendExpression(.{ .selector = .{
+            .operand = ident,
+            .field = try self.parseIdentifier(false),
+        } });
+    }
+    return ident;
+}
+
 fn parseAttributes(self: *Parser) !Ast.ManyIndex {
     _ = try self.expectKind(.attribute);
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var attributes = std.ArrayList(Ast.Expression).init(fba.allocator());
     if (isKind(self.this_token, .identifier)) {
-        const ident = try self.parseIdentifier(false);
+        const ident = try self.parseSingleAttributeChain();
         const value: ?Ast.Index = blk: {
             if (isOperator(self.this_token, .lparen)) {
                 _ = try self.expectOperator(.lparen);
@@ -1166,7 +1207,7 @@ fn parseAttributes(self: *Parser) !Ast.ManyIndex {
         _ = try self.expectOperator(.lparen);
         self.expression_depth += 1;
         while (!isOperator(self.this_token, .rparen) and !isKind(self.this_token, .eof)) {
-            const ident = try self.parseIdentifier(false);
+            const ident = try self.parseSingleAttributeChain();
             const value: ?Ast.Index = blk: {
                 if (isAssignment(self.this_token, .eq)) {
                     _ = try self.expectAssignment(.eq);
@@ -1238,7 +1279,9 @@ fn parseMapTypeExpression(self: *Parser) !Ast.Index {
     _ = try self.expectOperator(.rbracket);
     const value = try self.parseType();
     const key = try self.ast.appendExpression(.{ .typ = .{
-        .expression = key_expression,
+        .expression = .{
+            .expression = key_expression,
+        },
     } });
     return try self.ast.appendExpression(.{ .typ = .{ .map = .{
         .key = key,
@@ -1330,13 +1373,13 @@ fn parseDistinctTypeExpression(self: *Parser) !Ast.Index {
 }
 
 fn parseProcedureGroupExpression(self: *Parser) !Ast.Index {
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    var expressions = std.ArrayList(Ast.Index).init(fba.allocator());
+    var expressions = std.ArrayList(Ast.Expression).init(fba.allocator());
     _ = try self.expectKind(.lbrace);
     while (!isKind(self.this_token, .rbrace) and !isKind(self.this_token, .eof)) {
-        try expressions.append(try self.ast.appendExpression(.{ .ref = try self.parseExpression(false) }));
+        try expressions.append(.{ .ref = try self.parseExpression(false) });
         if (!self.acceptedSeparator()) break;
     }
     _ = try self.expectKind(.rbrace);
@@ -1377,7 +1420,7 @@ fn parseStructTypeExpression(self: *Parser) !Ast.Index {
 
     _ = try self.advancePossibleNewline();
 
-    const where_clauses: ?Ast.Index = blk: {
+    const where_clauses: ?Ast.ManyIndex = blk: {
         if (self.acceptedKeyword(.where)) {
             const depth = self.expression_depth;
             self.expression_depth = -1;
@@ -1399,6 +1442,7 @@ fn parseStructTypeExpression(self: *Parser) !Ast.Index {
         .fields = fields,
         .where_clauses = where_clauses,
         .parameters = parameters,
+        .kind = if (parameters != null) .generic else .concrete,
     } } });
 }
 
@@ -1436,7 +1480,7 @@ fn parseUnionTypeExpression(self: *Parser) !Ast.Index {
 
     _ = try self.advancePossibleNewline();
 
-    const where_clauses: ?Ast.Index = blk: {
+    const where_clauses: ?Ast.ManyIndex = blk: {
         if (self.acceptedKeyword(.where)) {
             const depth = self.expression_depth;
             self.expression_depth = -1;
@@ -1459,6 +1503,7 @@ fn parseUnionTypeExpression(self: *Parser) !Ast.Index {
         .variants = variants,
         .where_clauses = where_clauses,
         .parameters = parameters,
+        .kind = if (parameters != null) .generic else .concrete,
     } } });
 }
 
@@ -1473,7 +1518,7 @@ fn parseEnumTypeExpression(self: *Parser) !Ast.Index {
 
     _ = try self.advancePossibleNewline();
 
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var fields = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -1493,7 +1538,7 @@ fn parseEnumTypeExpression(self: *Parser) !Ast.Index {
         }
 
         try fields.append(.{ .field = .{
-            .name = got_name,
+            .name = name,
             .value = value,
         } });
         if (!self.acceptedSeparator()) break;
@@ -1611,7 +1656,7 @@ fn expectClosing(self: *Parser, kind: lexemes.TokenKind) !Lexer.Token {
     return self.expectKind(kind);
 }
 
-fn parseIndexExpression(self: *Parser, operand: Ast.Index) !Ast.Index {
+fn parseIndexExpression(self: *Parser, operand: Ast.Index) Error!Ast.Index {
     var lhs: ?Ast.Index = null;
     var rhs: ?Ast.Index = null;
 
@@ -1625,7 +1670,7 @@ fn parseIndexExpression(self: *Parser, operand: Ast.Index) !Ast.Index {
 
     if (isOperator(self.this_token, .ellipsis) or isOperator(self.this_token, .rangefull) or isOperator(self.this_token, .rangehalf)) {
         self.err("Expected `:` in index expression, not {s}", .{@tagName(self.this_token.un)});
-        return error.ParseIndexExpression;
+        return error.Parse;
     }
 
     var interval: ?Lexer.Token = null;
@@ -1778,8 +1823,8 @@ fn parseBinaryExpression(self: *Parser, lhs: bool, prec: i32) Error!Ast.Index {
                 return error.Parse;
             };
             expr = try self.ast.appendExpression(.{ .binary = .{
-                .operator = token.un.operator,
-                .lhs = expr,
+                .operation = token.un.operator,
+                .lhs = try self.ast.appendManyExpression(&.{.{ .ref = expr }}),
                 .rhs = rhs,
             } });
         }
@@ -1794,7 +1839,7 @@ fn parseTupleExpression(self: *Parser, lhs: bool) !Ast.ManyIndex {
     const allow_newline = self.allow_newline;
     self.allow_newline = true;
 
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var expressions = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -1813,7 +1858,7 @@ fn parseLhsTupleExpression(self: *Parser) !Ast.ManyIndex {
 }
 
 fn parseStatementList(self: *Parser, block_flags: Ast.BlockFlags) !Ast.ManyIndex {
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     var statements = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -1895,7 +1940,7 @@ fn parseDeclarationStatementTail(self: *Parser, names: Ast.ManyIndex) !Ast.Index
     }
 
     if (ty != null and n_values == 0) {
-        var buf = std.mem.zeroes([512]u8);
+        var buf = expressionBuffer(128);
         var fba = std.heap.FixedBufferAllocator.init(&buf);
 
         var expressions = std.ArrayList(Ast.Expression).init(fba.allocator());
@@ -1913,11 +1958,13 @@ fn parseDeclarationStatementTail(self: *Parser, names: Ast.ManyIndex) !Ast.Index
         .identifiers = names,
         .typ = ty,
         .values = values orelse unreachable,
+        .kind = if (constant) .constant else .variable,
+        .attributes = .none,
     } } });
 }
 
 fn parseDeclarationStatement(self: *Parser, lhs: Ast.ManyIndex) !Ast.Index {
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var names = std.ArrayList(Ast.Expression).init(fba.allocator());
     var it = self.ast.iterateManyExpression(lhs);
@@ -1937,7 +1984,7 @@ fn parseDeclarationStatement(self: *Parser, lhs: Ast.ManyIndex) !Ast.Index {
     );
 }
 
-fn parseAssignmentStatement(self: *Parser, lhs: Ast.Index) !Ast.Index {
+fn parseAssignmentStatement(self: *Parser, lhs: Ast.ManyIndex) !Ast.Index {
     if (self.this_procedure == null) {
         self.err("Assignment statements can only be used in procedures", .{});
         return error.Parse;
@@ -1960,7 +2007,7 @@ fn parseAssignmentStatement(self: *Parser, lhs: Ast.Index) !Ast.Index {
     return try self.ast.appendExpression(.{ .statement = .{ .assignment = .{
         .lhs = lhs,
         .rhs = rhs,
-        .kind = kind,
+        .assignment = kind,
     } } });
 }
 
@@ -1982,7 +2029,9 @@ fn parseSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags, allow_in: bo
                         .lhs = lhs,
                         .rhs = rhs,
                     } });
-                    return expression;
+                    return try self.ast.appendExpression(.{
+                        .statement = .{ .expression = expression },
+                    });
                 }
             },
             .colon => {
@@ -2008,11 +2057,11 @@ fn parseSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags, allow_in: bo
                             return error.Parse;
                         };
                         const got_statement = self.ast.mutateExpression(statement);
-                        switch (got_statement.*) {
+                        switch (got_statement.statement) {
                             inline .block,
-                            .@"if",
-                            .@"for",
-                            .@"switch",
+                            .ifs,
+                            .fors,
+                            .switchs,
                             => |*s| s.label = label_index,
                             else => {
                                 self.err("Cannot apply block `{s}` to `{s}`", .{ label.identifier.contents, @tagName(got_statement.*) });
@@ -2022,7 +2071,7 @@ fn parseSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags, allow_in: bo
                         return statement;
                     }
 
-                    return try self.parseDeclarationStatement(lhs, false);
+                    return try self.parseDeclarationStatement(lhs);
                 }
             },
             else => {},
@@ -2030,13 +2079,14 @@ fn parseSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags, allow_in: bo
         else => {},
     }
 
-    const got_expressions = self.ast.getManyExpression(lhs);
-    if (got_expressions.len == 0 or got_expressions.len > 1) {
-        self.err("Expected single expression for declaration, got `{}`", .{got_expressions.len});
+    var got_expressions = self.ast.iterateManyExpression(lhs);
+
+    if (got_expressions.size() == 0 or got_expressions.size() > 1) {
+        self.err("Expected single expression for declaration, got `{}`", .{got_expressions.size()});
         return error.Parse;
     }
 
-    return try self.ast.appendExpression(.{ .statement = .{ .expression = got_expressions[0] } });
+    return try self.ast.appendExpression(.{ .statement = .{ .expression = got_expressions.next().?.index } });
 }
 
 fn parseImportStatement(self: *Parser, is_using: bool) !Ast.Index {
@@ -2069,7 +2119,7 @@ fn parseImportStatement(self: *Parser, is_using: bool) !Ast.Index {
             const pathname = next[idx + 1 ..];
             break :blk try self.ast.appendExpression(.{ .statement = .{ .import = .{
                 .name = name,
-                .path = pathname,
+                .pathname = pathname,
                 .collection = collection,
                 .using = is_using,
                 .location = self.this_token.location,
@@ -2077,7 +2127,7 @@ fn parseImportStatement(self: *Parser, is_using: bool) !Ast.Index {
         } else {
             break :blk try self.ast.appendExpression(.{ .statement = .{ .import = .{
                 .name = name,
-                .path = next,
+                .pathname = next,
                 .collection = null,
                 .using = is_using,
                 .location = self.this_token.location,
@@ -2089,16 +2139,17 @@ fn parseImportStatement(self: *Parser, is_using: bool) !Ast.Index {
 }
 
 fn wrapStatementBlock(self: *Parser, block_flags: Ast.BlockFlags, statement: Ast.Index) !Ast.Index {
-    const got_statement = self.ast.getExpression(statement);
+    const got = self.ast.getExpression(statement);
+    const got_statement = got.statement;
     if (got_statement == .block or got_statement == .empty) {
         self.err("Expected regular statement, got `{s}`", .{@tagName(got_statement)});
         return error.Parse;
     }
-    return try self.ast.appendExpression(.{ .block = .{
+    return try self.ast.appendExpression(.{ .statement = .{ .block = .{
         .flags = block_flags,
         .label = null,
         .statements = try self.ast.appendManyExpression(&.{Ast.Expression{ .ref = statement }}),
-    } });
+    } } });
 }
 
 fn unwrapStatementExpression(self: *Parser, statement: ?Ast.Index) !?Ast.Index {
@@ -2171,11 +2222,11 @@ fn parseIfStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     if (isKeyword(self.this_token, .@"else")) {
         _ = try self.expectKeyword(.@"else");
         if (isKeyword(self.this_token, .@"if")) {
-            elif = try self.ast.appendExpression(.{ .block = .{
+            elif = try self.ast.appendExpression(.{ .statement = .{ .block = .{
                 .flags = block_flags,
                 .label = null,
                 .statements = try self.ast.appendManyExpression(&.{Ast.Expression{ .ref = try self.parseIfStatement(block_flags) }}),
-            } });
+            } } });
         } else if (isKind(self.this_token, .lbrace)) {
             elif = try self.parseBlockStatement(block_flags, false);
         } else if (isKeyword(self.this_token, .do)) {
@@ -2190,8 +2241,14 @@ fn parseIfStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     return try self.ast.appendExpression(.{
         .statement = .{ .ifs = .{
             .init = init_stmt,
-            .condition = condition,
-            .body = body,
+            .condition = condition orelse {
+                self.err("Expected condition in `if` statement", .{});
+                return error.Parse;
+            },
+            .body = body orelse {
+                self.err("Expected body in `if` statement", .{});
+                return error.Parse;
+            },
             .elif = elif,
             .label = null,
         } },
@@ -2227,11 +2284,11 @@ fn parseWhenStatement(self: *Parser) !Ast.Index {
     if (isKeyword(self.this_token, .@"else")) {
         _ = try self.expectKeyword(.@"else");
         if (isKeyword(self.this_token, .when)) {
-            elif = try self.ast.appendExpression(.{ .block = .{
+            elif = try self.ast.appendExpression(.{ .statement = .{ .block = .{
                 .flags = flags,
                 .label = null,
                 .statements = try self.ast.appendManyExpression(&.{Ast.Expression{ .ref = try self.parseWhenStatement() }}),
-            } });
+            } } });
         } else if (isKeyword(self.this_token, .do)) {
             _ = try self.expectKeyword(.do);
             elif = try self.parseDoBody(flags);
@@ -2245,7 +2302,10 @@ fn parseWhenStatement(self: *Parser) !Ast.Index {
 
     return try self.ast.appendExpression(.{ .statement = .{ .when = .{
         .condition = try condition,
-        .body = body,
+        .body = body orelse {
+            self.err("Expected body in `when` statement", .{});
+            return error.Parse;
+        },
         .elif = elif,
     } } });
 }
@@ -2271,16 +2331,16 @@ fn parseForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
         }
 
         if (!isKind(token, .semicolon)) {
-            const statement = try self.parseSimpleStatement(block_flags, true, false);
-            const got_statement = self.ast.getExpression(statement);
-            if (got_statement.statement == .expression) {
-                condition = got_statement.statement.expression;
+            const expression = try self.parseSimpleStatement(block_flags, true, false);
+            const got_expression = self.ast.getExpression(expression);
+            if (got_expression.statement == .expression) {
+                condition = got_expression.statement.expression;
                 const got_condition = self.ast.getExpression(condition.?);
                 if (got_condition == .binary and got_condition.binary.operation == .in) {
                     range = true;
                 }
             } else {
-                init_stmt = statement;
+                init_stmt = expression;
                 condition = null;
             }
         }
@@ -2315,8 +2375,14 @@ fn parseForStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     return try self.ast.appendExpression(.{
         .statement = .{ .fors = .{
             .init = init_stmt,
-            .condition = condition,
-            .body = body,
+            .condition = condition orelse {
+                self.err("Expected condition in `for` statement", .{});
+                return error.Parse;
+            },
+            .body = body orelse {
+                self.err("Expected body in `for` statement", .{});
+                return error.Parse;
+            },
             .post = post_stmt,
             .label = null,
         } },
@@ -2371,7 +2437,7 @@ fn parseSwitchStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
         const got_c = self.ast.getExpression(c);
         break :blk (got_c == .binary and got_c.binary.operation == .in);
     } else false;
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var clauses = std.ArrayList(Ast.Expression).init(fba.allocator());
     _ = try self.advancePossibleNewline();
@@ -2393,78 +2459,86 @@ fn parseSwitchStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
 
 fn parseDeferStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     _ = try self.expectKeyword(.@"defer");
-    return try self.ast.newDeferStatement((try self.parseStatement(block_flags)) orelse {
-        self.err("Expected statement after `defer`", .{});
-        return error.Parse;
-    });
+    return try self.ast.appendExpression(.{ .statement = .{ .defers = .{
+        .statement = (try self.parseStatement(block_flags)) orelse {
+            self.err("Expected statement after `defer`", .{});
+            return error.Parse;
+        },
+    } } });
 }
 
-fn parseReturnStatement(self: *Parser) !Ast.StatementIndex {
+fn parseReturnStatement(self: *Parser) !Ast.Index {
     _ = try self.expectKeyword(.@"return");
 
     if (self.expression_depth > 0) {
         self.err("Cannot return from expression", .{});
-        return error.ParseReturnStatement;
+        return error.Parse;
     }
 
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    var results = std.ArrayList(Ast.AnyIndex).init(fba.allocator());
+    var results = std.ArrayList(Ast.Expression).init(fba.allocator());
     while (!isKind(self.this_token, .semicolon) and !isKind(self.this_token, .rbrace) and !isKind(self.this_token, .eof)) {
-        try results.append(Ast.AnyIndex.from(try self.parseExpression(false)));
+        try results.append(.{ .ref = try self.parseExpression(false) });
         if (!isOperator(self.this_token, .comma) or isKind(self.this_token, .eof)) break;
         _ = try self.advance();
     }
 
     try self.expectSemicolon();
 
-    return try self.ast.newReturnStatement(try self.ast.newTupleExpression(
-        try self.ast.createRef(results.items),
-    ));
+    return try self.ast.appendExpression(.{ .statement = .{ .returns = .{
+        .expression = try self.ast.appendManyExpression(results.items),
+    } } });
 }
 
-fn parseBasicSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.StatementIndex {
+fn parseBasicSimpleStatement(self: *Parser, block_flags: Ast.BlockFlags) !Ast.Index {
     const statement = try self.parseSimpleStatement(block_flags, false, true);
     try self.expectSemicolon();
     return statement;
 }
 
-fn parseForeignBlockStatement(self: *Parser) !Ast.StatementIndex {
-    var name: ?Ast.IdentifierIndex = null;
+fn parseForeignBlockStatement(self: *Parser) !Ast.Index {
+    var name: ?Ast.Index = null;
     if (isKind(self.this_token, .identifier)) {
         name = try self.parseIdentifier(false);
     }
 
-    var buf = std.mem.zeroes([512]u8);
+    var buf = expressionBuffer(128);
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    var statements = std.ArrayList(Ast.AnyIndex).init(fba.allocator());
+    var statements = std.ArrayList(Ast.Expression).init(fba.allocator());
     _ = try self.advancePossibleNewlineWithin();
     _ = try self.expectKind(.lbrace);
     while (!isKind(self.this_token, .rbrace) and !isKind(self.this_token, .eof)) {
-        try statements.append(Ast.AnyIndex.from((try self.parseStatement(Ast.BlockFlags{})) orelse {
-            self.err("Expected statement in foreign block", .{});
-            return error.ParseForeignBlockStatement;
-        }));
+        try statements.append(.{
+            .ref = (try self.parseStatement(Ast.BlockFlags{})) orelse {
+                self.err("Expected statement in foreign block", .{});
+                return error.Parse;
+            },
+        });
     }
     _ = try self.expectKind(.rbrace);
 
-    const block = try self.ast.newBlockStatement(
-        Ast.BlockFlags{},
-        try self.ast.createRef(statements.items),
-        null,
-    );
-    const statement = try self.ast.newForeignBlockStatement(name, block, Ast.RefIndex.none);
+    const block = try self.ast.appendExpression(.{ .statement = .{ .block = .{
+        .flags = Ast.BlockFlags{},
+        .label = name,
+        .statements = try self.ast.appendManyExpression(statements.items),
+    } } });
+    const statement = try self.ast.appendExpression(.{ .statement = .{ .foreign_block = .{
+        .name = name,
+        .body = block,
+        .attributes = .none,
+    } } });
     _ = try self.expectSemicolon();
 
     return statement;
 }
 
-fn parseForiegnImportStatement(self: *Parser) !Ast.StatementIndex {
+fn parseForiegnImportStatement(self: *Parser) !Ast.Index {
     _ = try self.expectKeyword(.import);
 
-    var name: ?lexer.Token = null;
+    var name: ?Lexer.Token = null;
     if (isKind(self.this_token, .identifier)) {
         name = try self.advance();
     }
@@ -2480,14 +2554,14 @@ fn parseForiegnImportStatement(self: *Parser) !Ast.StatementIndex {
         try sources.append((try self.expectLiteral(.string)).string);
     }
 
-    return try self.ast.newForeignImportStatement(
-        if (name) |n| n.string else "",
-        sources,
-        Ast.RefIndex.none,
-    );
+    return try self.ast.appendExpression(.{ .statement = .{ .foreign_import = .{
+        .name = (name orelse Lexer.Token.invalid).string,
+        .sources = sources,
+        .attributes = .none,
+    } } });
 }
 
-fn parseForignDeclarationStatement(self: *Parser) !?Ast.StatementIndex {
+fn parseForignDeclarationStatement(self: *Parser) !?Ast.Index {
     _ = try self.expectKeyword(.foreign);
     if (isKind(self.this_token, .identifier) or isKind(self.this_token, .lbrace)) {
         return try self.parseForeignBlockStatement();
@@ -2498,15 +2572,18 @@ fn parseForignDeclarationStatement(self: *Parser) !?Ast.StatementIndex {
     return null;
 }
 
-fn parseBranchStatement(self: *Parser, kind: lexemes.KeywordKind) !Ast.StatementIndex {
+fn parseBranchStatement(self: *Parser, kind: lexemes.KeywordKind) !Ast.Index {
     _ = try self.advance();
 
-    var label: ?Ast.IdentifierIndex = null;
+    var label: ?Ast.Index = null;
     if (isKind(self.this_token, .identifier)) {
         label = try self.parseIdentifier(false);
     }
 
-    return try self.ast.newBranchStatement(kind, label);
+    return try self.ast.appendExpression(.{ .statement = .{ .branch = .{
+        .branch = kind,
+        .label = label,
+    } } });
 }
 
 fn parseUsingStatement(self: *Parser) !Ast.Index {
@@ -2520,15 +2597,18 @@ fn parseUsingStatement(self: *Parser) !Ast.Index {
     return error.Parse;
 }
 
-fn parsePackageStatement(self: *Parser) !Ast.StatementIndex {
+fn parsePackageStatement(self: *Parser) !Ast.Index {
     _ = try self.expectKeyword(.package);
     const package = try self.expectKind(.identifier);
     try self.ast.recordToken(package);
-    return try self.ast.newPackageStatement(package.string);
+    return try self.ast.appendExpression(.{ .statement = .{ .package = .{
+        .name = package.string,
+        .location = package.location,
+    } } });
 }
 
-fn parseEmptyStatement(self: *Parser) !Ast.StatementIndex {
-    const statement = try self.ast.newEmptyStatement();
+fn parseEmptyStatement(self: *Parser) !Ast.Index {
+    const statement = try self.ast.appendExpression(.{ .statement = .empty });
     _ = try self.expectSemicolon();
     return statement;
 }
@@ -2560,6 +2640,10 @@ fn isLiteral(token: Lexer.Token, kind: lexemes.LiteralKind) bool {
 
 fn isNewline(token: Lexer.Token) bool {
     return token.un == .semicolon and std.mem.eql(u8, token.string, "\n");
+}
+
+fn expressionBuffer(comptime capacity: usize) [capacity * @sizeOf(Ast.Expression)]u8 {
+    return std.mem.zeroes([capacity * @sizeOf(Ast.Expression)]u8);
 }
 
 test {

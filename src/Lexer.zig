@@ -187,8 +187,8 @@ pub fn next(self: *Lexer) Token {
     return self.rawNext();
 }
 
-pub fn peek(self: *Lexer) !Token {
-    try self.peek_list.appendAssumeCapacity(self.rawNext());
+pub fn peek(self: *Lexer) Token {
+    self.peek_list.appendAssumeCapacity(self.rawNext());
     return self.peek_list.getLast();
 }
 

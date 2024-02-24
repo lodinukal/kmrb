@@ -5,6 +5,7 @@ const Lexer = @import("Lexer.zig");
 const lexemes = @import("lexemes.zig");
 
 allocator: std.mem.Allocator,
+statements: std.ArrayListUnmanaged(Index),
 expressions: std.ArrayListUnmanaged(Expression),
 imports: std.ArrayListUnmanaged(Index),
 tokens: std.ArrayListUnmanaged(Lexer.Token),
@@ -12,13 +13,15 @@ tokens: std.ArrayListUnmanaged(Lexer.Token),
 pub fn init(allocator: std.mem.Allocator) Ast {
     return Ast{
         .allocator = allocator,
-        .expressions = std.ArrayList(Expression).init(allocator),
-        .imports = std.ArrayList(Index).init(allocator),
-        .tokens = std.ArrayList(Lexer.Token).init(allocator),
+        .statements = std.ArrayListUnmanaged(Index){},
+        .expressions = std.ArrayListUnmanaged(Expression){},
+        .imports = std.ArrayListUnmanaged(Index){},
+        .tokens = std.ArrayListUnmanaged(Lexer.Token){},
     };
 }
 
 pub fn deinit(self: *Ast) void {
+    self.statements.deinit(self.allocator);
     self.expressions.deinit(self.allocator);
     self.imports.deinit(self.allocator);
     self.tokens.deinit(self.allocator);
@@ -45,24 +48,24 @@ pub fn mutateExpression(self: *Ast, index: Index) *Expression {
 
 pub fn appendExpression(self: *Ast, expression: Expression) !Index {
     const index = self.expressions.items.len;
-    try self.expressions.append(expression);
+    try self.expressions.append(self.allocator, expression);
     return @enumFromInt(index);
 }
 
 pub fn appendManyExpression(self: *Ast, items: []const Expression) !ManyIndex {
     const index = self.expressions.items.len;
-    try self.expressions.append(.{
+    try self.expressions.append(self.allocator, .{
         .many = items.len,
     });
-    try self.expressions.appendSlice(items);
+    try self.expressions.appendSlice(self.allocator, items);
     return @enumFromInt(index);
 }
 
 pub fn getManyExpression(self: *Ast, index: ManyIndex) []const Expression {
     if (index == .none) return &.{};
     const start = @intFromEnum(index);
-    const end = start + self.expressions.items[start].many;
-    return self.expressions.items[start + 1 .. end];
+    const count = self.expressions.items[start].many;
+    return self.expressions.items[start + 1 .. start + count + 1];
 }
 
 pub fn iterateManyExpression(self: *Ast, index: ManyIndex) ManyIterator(false) {
@@ -70,15 +73,15 @@ pub fn iterateManyExpression(self: *Ast, index: ManyIndex) ManyIterator(false) {
         .ast = self,
         .index = index,
         .current = @intFromEnum(index) + 1,
-        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many,
+        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many + 1,
     };
 }
 
 pub fn mutateManyExpression(self: *Ast, index: ManyIndex) []Expression {
     if (index == .none) return &.{};
     const start = @intFromEnum(index);
-    const end = start + self.expressions.items[start].many;
-    return self.expressions.items[start + 1 .. end];
+    const count = self.expressions.items[start].many;
+    return self.expressions.items[start + 1 .. start + count + 1];
 }
 
 pub fn iterateManyExpressionMut(self: *Ast, index: ManyIndex) ManyIterator(true) {
@@ -86,7 +89,7 @@ pub fn iterateManyExpressionMut(self: *Ast, index: ManyIndex) ManyIterator(true)
         .ast = self,
         .index = index,
         .current = @intFromEnum(index) + 1,
-        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many,
+        .end = @intFromEnum(index) + self.expressions.items[@intFromEnum(index)].many + 1,
     };
 }
 
@@ -134,31 +137,8 @@ pub fn ManyIterator(comptime mutable: bool) type {
 
 pub const Index = enum(usize) { none = std.math.maxInt(usize), _ };
 pub const ManyIndex = enum(usize) { none = std.math.maxInt(usize), _ };
-pub const Expression = union(Tag) {
-    const Tag = enum {
-        identifier,
-        typ,
-        selector,
-        unwrap,
-        unary,
-        compound_literal,
-        block,
-        call,
-        literal,
-        procedure_group,
-        undefined,
-        index,
-        cast,
-        ternary,
-        binary,
-        statement,
-        context,
-
-        many,
-        ref,
-        field,
-        case_clause,
-    };
+pub const Expression = union(enum) {
+    const Tag = std.meta.Tag(Expression);
 
     identifier: Identifier,
     typ: Typ,
@@ -166,7 +146,6 @@ pub const Expression = union(Tag) {
     unwrap: Unwrap,
     unary: Unary,
     compound_literal: CompoundLiteral,
-    block: Block,
     procedure: Procedure,
     call: Call,
     literal: Literal,
@@ -214,7 +193,7 @@ pub const Expression = union(Tag) {
             kind: BuiltinTypeKind,
             size: u16,
             alignof: u16,
-            endianess: Endianess,
+            endianness: Endianness,
         };
 
         pub const ProcedureType = struct {
@@ -288,7 +267,7 @@ pub const Expression = union(Tag) {
             flags: StructFlags,
             alignment: ?Index,
             fields: ManyIndex,
-            where_clauses: ?Index,
+            where_clauses: ?ManyIndex,
 
             parameters: ?ManyIndex,
         };
@@ -298,7 +277,7 @@ pub const Expression = union(Tag) {
             flags: UnionFlags,
             alignment: ?Index,
             variants: ManyIndex,
-            where_clauses: ?Index,
+            where_clauses: ?ManyIndex,
 
             parameters: ?ManyIndex,
         };
@@ -327,13 +306,6 @@ pub const Expression = union(Tag) {
     pub const CompoundLiteral = struct {
         typ: ?Index,
         fields: ManyIndex,
-    };
-
-    pub const Block = struct {
-        flags: BlockFlags,
-        statements: ManyIndex,
-        // identifier
-        label: ?Index,
     };
 
     pub const Procedure = struct {
@@ -377,12 +349,14 @@ pub const Expression = union(Tag) {
 
     pub const Binary = struct {
         operation: lexemes.OperatorKind,
-        lhs: Index,
+        /// ManyIndex to support .in
+        lhs: ManyIndex,
         rhs: Index,
     };
 
     pub const Statement = union(enum) {
         empty,
+        block: Block,
         declaration: Declaration,
         assignment: Assignment,
         expression: Index,
@@ -391,6 +365,19 @@ pub const Expression = union(Tag) {
         when: When,
         fors: For,
         switchs: Switch,
+        defers: Defer,
+        returns: Return,
+        foreign_block: ForeignBlock,
+        foreign_import: ForeignImport,
+        branch: Branch,
+        package: Package,
+
+        pub const Block = struct {
+            flags: BlockFlags,
+            statements: ManyIndex,
+            // identifier
+            label: ?Index,
+        };
 
         pub const Declaration = struct {
             pub const Kind = enum {
@@ -407,8 +394,8 @@ pub const Expression = union(Tag) {
 
         pub const Assignment = struct {
             assignment: lexemes.AssignmentKind,
-            lhs: Index,
-            rhs: Index,
+            lhs: ManyIndex,
+            rhs: ManyIndex,
         };
 
         pub const Import = struct {
@@ -460,19 +447,54 @@ pub const Expression = union(Tag) {
             /// expression
             condition: ?Index,
             /// many caseclause
-            clauses: Index, // std.ArrayList(CaseClauseIndex),
+            clauses: ManyIndex, // std.ArrayList(CaseClauseIndex),
             /// identifier
             label: ?Index,
+        };
+
+        pub const Defer = struct {
+            statement: Index,
+        };
+
+        pub const Return = struct {
+            expression: ManyIndex,
+        };
+
+        pub const ForeignBlock = struct {
+            /// identifier
+            name: ?Index = null,
+            /// statement
+            body: Index,
+            /// many field
+            attributes: ManyIndex, // std.ArrayList(FieldIndex),
+        };
+
+        pub const ForeignImport = struct {
+            name: []const u8,
+            sources: std.ArrayList([]const u8),
+            /// many field
+            attributes: ManyIndex, // std.ArrayList(FieldIndex),
+        };
+
+        pub const Branch = struct {
+            branch: lexemes.KeywordKind,
+            /// identifier
+            label: ?Index,
+        };
+
+        pub const Package = struct {
+            name: []const u8,
+            location: Lexer.Location,
         };
     };
 
     pub const Field = struct {
-        name: ?Index,
-        typ: ?Index,
-        value: ?Index,
-        tag: ?[]const u8,
-        flags: FieldFlags,
-        attributes: ?ManyIndex,
+        name: ?Index = null,
+        typ: ?Index = null,
+        value: ?Index = null,
+        tag: ?[]const u8 = null,
+        flags: FieldFlags = .{},
+        attributes: ?ManyIndex = null,
     };
 
     pub const CaseClause = struct {
@@ -505,7 +527,7 @@ pub const DefinitionType = enum(u8) {
     generic,
 };
 
-pub const Endianess = enum(u8) {
+pub const Endianness = enum(u8) {
     na,
     little,
     big,
