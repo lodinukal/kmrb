@@ -156,6 +156,7 @@ pub const Expression = union(enum) {
     ternary: Ternary,
     binary: Binary,
     statement: Statement,
+    compile_time: Index,
     context: void,
 
     many: usize, // comes right after the current expression

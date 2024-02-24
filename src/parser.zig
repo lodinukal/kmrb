@@ -437,6 +437,7 @@ fn parseAtomExpression(self: *Parser, opt_operand: ?Ast.Index, lhs: bool) Error!
             return null;
         }
         self.err("Expected operand, got `{s}`", .{@tagName(self.this_token.un)});
+        return error.Parse;
     }
     var operand = opt_operand.?;
 
@@ -1047,11 +1048,23 @@ fn parseUnaryExpression(self: *Parser, lhs: bool) Error!Ast.Index {
             .period => return try self.parseImplicitSelectorExpression(),
             else => {},
         },
+        .compile_execution => {
+            if (lhs) {
+                self.err("Compile time execution not allowed in this context", .{});
+                return error.Parse;
+            }
+            return try self.parseCompileExecutionExpression();
+        },
         else => {},
     }
 
     const operand = try self.parseOperand(lhs);
     return (try self.parseAtomExpression(operand, lhs)).?;
+}
+
+fn parseCompileExecutionExpression(self: *Parser) !Ast.Index {
+    _ = try self.expectKind(.compile_execution);
+    return try self.ast.appendExpression(.{ .compile_time = try self.parseExpression(false) });
 }
 
 fn parseDirectiveCallExpression(self: *Parser, name: []const u8) !Ast.Index {

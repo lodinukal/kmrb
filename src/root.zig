@@ -18,7 +18,7 @@ test "basic" {
         \\}
         \\
         \\main :: proc() {
-        \\  system := ecs.new_system(Health);
+        \\  system := ## ecs.new_system(Health);
         \\  defer ecs.destroy(&system);
         \\  for x in 0..10 {
         \\      print("hello world\n")

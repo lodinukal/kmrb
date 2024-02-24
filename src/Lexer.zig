@@ -29,6 +29,7 @@ pub const Token = struct {
         keyword: lexemes.KeywordKind,
         assignment: lexemes.AssignmentKind,
         directive: lexemes.DirectiveKind,
+        compile_execution,
         attribute,
         @"const",
         semicolon,
@@ -616,6 +617,11 @@ fn tokenise(self: *Lexer) Token {
             }
         },
         '#' => {
+            // compile time
+            if (self.codepoint == '#') {
+                _ = self.advance();
+                return self.tokenVoid(.compile_execution);
+            }
             while (isChar(self.codepoint)) {
                 _ = self.advance();
             }
