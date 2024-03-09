@@ -472,7 +472,7 @@ pub const Expression = union(enum) {
 
         pub const ForeignImport = struct {
             name: []const u8,
-            sources: std.ArrayList([]const u8),
+            sources: ManyIndex, // std.ArrayList(IdentifierIndex),
             /// many field
             attributes: ManyIndex, // std.ArrayList(FieldIndex),
         };

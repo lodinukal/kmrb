@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.setCwd(.{ .path = b.getInstallPath(.bin, "") });
 
     // By making the run step depend on the install step, it will be run from the
     // installation directory rather than directly from within the cache directory.
@@ -73,6 +74,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    run_lib_unit_tests.setCwd(run_cmd.cwd.?);
 
     const exe_unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/main.zig" },
@@ -81,6 +83,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    run_exe_unit_tests.setCwd(run_cmd.cwd.?);
+
+    const copy_test = b.addInstallDirectory(.{
+        .source_dir = .{ .path = "test" },
+        .install_dir = .bin,
+        .install_subdir = "test",
+    });
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
@@ -88,4 +97,5 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&copy_test.step);
 }

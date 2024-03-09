@@ -5,8 +5,7 @@ const Lexer = @import("Lexer.zig");
 const Ast = @import("Ast.zig");
 const lexemes = @import("lexemes.zig");
 
-allocator: std.mem.Allocator,
-ast: Ast,
+ast: *Ast,
 lexer: Lexer,
 peek_list: [10]Lexer.Token = .{Lexer.Token.invalid} ** 10,
 
@@ -27,25 +26,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
-pub fn init(allocator: std.mem.Allocator) Parser {
+pub fn init(ast: *Ast) Parser {
     return Parser{
-        .allocator = allocator,
-        .ast = Ast.init(allocator),
+        .ast = ast,
         .lexer = undefined,
     };
 }
 
 pub fn deinit(self: *Parser) void {
-    self.ast.deinit();
-}
-
-pub fn takeAst(self: *Parser) Ast {
-    defer self.ast = Ast.init(self.ast.allocator);
-    return self.ast;
+    _ = self;
 }
 
 /// Ast must be cleaned up by the caller
-pub fn parse(self: *Parser, source: Lexer.Source) Error!Ast {
+pub fn parse(self: *Parser, source: Lexer.Source) Error!void {
     self.lexer = Lexer.init(&self.peek_list, source);
     _ = try self.advance();
     while (!isKind(self.this_token, .eof)) {
@@ -55,7 +48,6 @@ pub fn parse(self: *Parser, source: Lexer.Source) Error!Ast {
                 try self.ast.statements.append(self.ast.allocator, statement);
         }
     }
-    return self.takeAst();
 }
 
 fn err(self: *const Parser, comptime msg: []const u8, args: anytype) void {
@@ -2556,20 +2548,29 @@ fn parseForiegnImportStatement(self: *Parser) !Ast.Index {
         name = try self.advance();
     }
 
-    var sources = std.ArrayList([]const u8).init(self.allocator);
+    var buf = expressionBuffer(128);
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var sources = std.ArrayList(Ast.Expression).init(fba.allocator());
     if (self.acceptedKind(.lbrace)) {
         while (!isKind(self.this_token, .rbrace) and !isKind(self.this_token, .eof)) {
-            try sources.append((try self.expectLiteral(.string)).string);
+            try sources.append(.{ .identifier = .{
+                .contents = (try self.expectLiteral(.string)).string,
+                .polymorphic = false,
+            } });
             if (!self.acceptedSeparator()) break;
         }
         _ = try self.expectClosing(.rbrace);
     } else {
-        try sources.append((try self.expectLiteral(.string)).string);
+        try sources.append(.{ .identifier = .{
+            .contents = (try self.expectLiteral(.string)).string,
+            .polymorphic = false,
+        } });
     }
 
     return try self.ast.appendExpression(.{ .statement = .{ .foreign_import = .{
         .name = (name orelse Lexer.Token.invalid).string,
-        .sources = sources,
+        .sources = try self.ast.appendManyExpression(sources.items),
         .attributes = .none,
     } } });
 }

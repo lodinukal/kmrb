@@ -4,8 +4,7 @@ const lexemes = @import("lexemes.zig");
 pub const codepoint = u21;
 
 pub const Source = struct {
-    name: []const u8,
-    directory: []const u8,
+    pathname: []const u8,
     code: []const u8,
 };
 

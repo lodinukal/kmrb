@@ -1,39 +1,23 @@
 const std = @import("std");
 const testing = std.testing;
 
-const Parser = @import("Parser.zig");
+const unit = @import("unit.zig");
+const StdFsSourceCollector = @import("source_collector.zig").StdFsSourceCollector;
 
 export fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
 test "basic" {
-    const t =
-        \\package oxy;
-        \\
-        \\urg: u32 = 0
-        \\
-        \\@ecs.Component
-        \\Health :: struct {
-        \\}
-        \\
-        \\main :: proc() {
-        \\  system := ## ecs.new_system(Health);
-        \\  defer ecs.destroy(&system);
-        \\  for x in 0..10 {
-        \\      print("hello world\n")
-        \\  }
-        \\  #assert(1 == 1)
-        \\}
-    ;
-
     const start = std.time.nanoTimestamp();
 
-    var parser = Parser.init(testing.allocator);
-    defer parser.deinit();
+    var fsc = StdFsSourceCollector.init(std.fs.cwd());
+    defer fsc.deinit();
 
-    var result = try parser.parse(.{ .code = t, .directory = "test", .name = "waa" });
-    defer result.deinit();
+    var build = try unit.Build.init(testing.allocator, fsc.collector());
+    defer build.deinit();
+
+    try build.addPackage("test");
 
     const end = std.time.nanoTimestamp();
 
